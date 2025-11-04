@@ -1,6 +1,7 @@
 from datetime import datetime
 import streamlit as st
 import pandas as pd
+from pyproj import Transformer
 
 
 @st.cache_data
@@ -15,7 +16,20 @@ st.title("Hoogtetoets")
 uploaded_file = st.file_uploader("Kies een CSV bestand", type="csv")
 
 if uploaded_file is not None:
+    st.write("### Uitgangspunten")
+    dth = st.number_input("Wat is de afkeurhoogte / dijktafelhoogte?", value=-0.4)
+
     df = load_data(uploaded_file)
+
+    # Check if x and y columns exist before trying to convert
+    if "x" in df.columns and "y" in df.columns:
+        # Create a transformer for coordinate conversion from RD New to WGS84
+        transformer = Transformer.from_crs("EPSG:28992", "EPSG:4326", always_xy=True)
+        # Perform the transformation
+        lons, lats = transformer.transform(df["x"].values, df["y"].values)
+        # Add the new lat/lon columns to the DataFrame
+        df["lat"] = lats
+        df["lon"] = lons
     st.write("De data uit het geuploadede CSV bestand:")
     st.dataframe(df)
 
@@ -23,12 +37,8 @@ if uploaded_file is not None:
     st.write("### Hoogteligging volgens AHN")
 
     # Check if all required columns are in the DataFrame
-    if all(col in df.columns for col in ["l", "z3", "z4", "z5"]):
-        st.line_chart(df, x="l", y=["z3", "z4", "z5"])
-    else:
-        st.warning(
-            f"To display the plot, the CSV must contain the following columns: {', '.join(["l","z3", "z4", "z5"])}"
-        )
+    df["dth"] = dth
+    st.line_chart(df, x="l", y=["z3", "z4", "z5", "dth"])
 
     st.write("### Achtergrondzetting volgens AHN")
     st.markdown(
@@ -56,9 +66,9 @@ nog een keer **refresh** te gebruiken met andere waarden voor de minimale en max
 
     # Initialize session state for the filter values if they don't exist
     if "min_dz" not in st.session_state:
-        st.session_state.min_dz = -0.05
+        st.session_state.min_dz = 0.0
     if "max_dz" not in st.session_state:
-        st.session_state.max_dz = 0.05
+        st.session_state.max_dz = 0.03
 
     with col1:
         # These sliders will just capture user input, not directly filter
@@ -130,12 +140,61 @@ Selecteer de planperiodes die je wilt onderzoeken. Hoe meer planperiodes hoe vol
             )
 
             plot_names = []
+            oph_plot_names = []
             for pp in selected_pps:
                 name = f"z_planperiode_{pp}"
                 plot_names.append(name)
                 df_result[name] = (
                     df_result[f"z_{now_year}"] - df_filtered[selected_agz[0]] * pp
                 )
+                oph_name = f"oph_{pp}"
+                oph_plot_names.append(oph_name)
+                df_result[oph_name] = df_result["dth"] - df_result[name]
+                df_result[oph_name] = df_result[oph_name].clip(lower=0)
 
-            st.line_chart(df_result, x="l", y=plot_names)
+            st.line_chart(df_result, x="l", y=plot_names + ["dth"])
             st.dataframe(df_result)
+
+            st.write("### Benodigde ophoging (excl zetting)")
+            st.line_chart(df_result, x="l", y=oph_plot_names)
+            st.dataframe(df_result)
+
+            # --- Color mapping for st.map ---
+            map_df = df_result.copy()
+
+            st.write("### Kaarten met de benodigde ophoging")
+            st.markdown(
+                """
+Let op dat in de onderstaande kaarten enkel gerekend is met de achtergrondzetting en **niet** met de zetting
+die optreedt door het aanbrengen van de ophoging (zettingscompensatie). Dit dient berekend te worden.
+
+De benodigde ophoging is uitgedrukt ik een kleurovergang van groen naar rood. Fel groen is geen ophoging,
+fel rood is een ophoging van een meter of meer. Zie het dataframe hierboven voor de berekende waarden genaamd 
+oph gevolgd door de planperiode, bv ```oph_5``` voor de benodigde ophoging voor een planperiode van 5 jaar etc.
+                """
+            )
+
+            for pp in selected_pps:
+                color_col_name = f"oph_{pp}"
+
+                # Check if the column for coloring exists (user must have selected '5' years)
+                if color_col_name in map_df.columns:
+                    st.write(
+                        f"#### Kaart met benodigde ophoging voor een planperiode van {pp} jaar"
+                    )
+
+                    maximized_values = map_df[color_col_name].clip(upper=1)
+
+                    # Create a 'color' column with RGB tuples [R, G, B]
+                    # It transitions from Green (low values) to Red (high values)
+                    # If a value is NaN, color it grey.
+                    map_df["color"] = maximized_values.apply(
+                        lambda x: (
+                            [0.5, 0.5, 0.5]
+                            if pd.isna(x)
+                            else [1.0 * x, 1.0 * (1 - x), 0.0]
+                        )
+                    )
+                    st.map(
+                        map_df, latitude="lat", longitude="lon", size=1, color="color"
+                    )
